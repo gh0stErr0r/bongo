@@ -1,20 +1,25 @@
 use gtk4::gdk;
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, Box, Image, Orientation};
-use gtk4_layer_shell::{Edge, Layer, LayerShell};
 use serde::Deserialize;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-const DEFAULT_IMG_REST: &str = "~/.config/bongo/cat-rest.png";
-const DEFAULT_IMG_LEFT: &str = "~/.config/bongo/cat-left.png";
-const DEFAULT_IMG_RIGHT: &str = "~/.config/bongo/cat-right.png";
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 
-const STATE_REST: u8 = 0;
-const STATE_LEFT: u8 = 1;
-const STATE_RIGHT: u8 = 2;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+pub(crate) const STATE_REST: u8 = 0;
+pub(crate) const STATE_LEFT: u8 = 1;
+pub(crate) const STATE_RIGHT: u8 = 2;
 
 #[derive(Debug, Deserialize, Clone)]
 struct Imgs {
@@ -32,6 +37,12 @@ struct Input {
 struct Config {
     pub imgs: Option<Imgs>,
     pub input: Option<Input>,
+    pub window: Option<Window>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct Window {
+    pub position: Option<String>,
 }
 
 impl Default for Config {
@@ -39,6 +50,7 @@ impl Default for Config {
         Config {
             imgs: None,
             input: None,
+            window: None,
         }
     }
 }
@@ -51,6 +63,20 @@ fn expand_path(path_option: Option<String>) -> Option<String> {
         }
     }
     Some(path)
+}
+
+fn image_path(configured_path: Option<String>, fallback_name: &str) -> String {
+    if let Some(path) = expand_path(configured_path) {
+        if Path::new(&path).exists() {
+            return path;
+        }
+        eprintln!("[WARN] Image not found: {path}");
+    }
+
+    let bundled_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("imgs")
+        .join(fallback_name);
+    bundled_path.to_string_lossy().into_owned()
 }
 
 pub fn main() -> glib::ExitCode {
@@ -76,9 +102,15 @@ pub fn main() -> glib::ExitCode {
         Config::default()
     };
 
-    let app = Application::builder()
-        .application_id("com.bongocat.widget")
-        .build();
+    if let Err(error) = gtk4::init() {
+        eprintln!("Failed to initialize GTK: {error}");
+        return glib::ExitCode::new(1);
+    }
+
+    let app = Application::new(
+        Some("com.bongocat.widget"),
+        gtk4::gio::ApplicationFlags::empty(),
+    );
 
     app.connect_activate(move |app| {
         build_ui(app, conf.clone());
@@ -93,46 +125,31 @@ fn build_ui(app: &Application, conf: Config) {
         .title("Bongo Cat Widget")
         .build();
 
-    window.init_layer_shell();
-    window.set_layer(Layer::Top);
+    let position = conf
+        .window
+        .as_ref()
+        .and_then(|window| window.position.clone())
+        .unwrap_or_else(|| "top-left".to_string());
 
-    window.set_anchor(Edge::Top, true);
-    window.set_anchor(Edge::Left, true);
-    window.set_anchor(Edge::Right, false);
-    window.set_anchor(Edge::Bottom, false);
-
-    window.set_margin(Edge::Top, 16);
-    window.set_margin(Edge::Left, 16);
-    window.set_exclusive_zone(0);
+    platform::configure_window(&window, &position);
 
     let container = Box::builder()
         .orientation(Orientation::Horizontal)
         .css_name("bongo-container")
         .build();
 
-    let img_rest_path = expand_path(
-        conf.imgs
-            .as_ref()
-            .and_then(|i| i.rest.clone())
-            .or_else(|| Some(DEFAULT_IMG_REST.to_string())),
-    )
-    .unwrap_or_default();
-
-    let img_left_path = expand_path(
-        conf.imgs
-            .as_ref()
-            .and_then(|i| i.left.clone())
-            .or_else(|| Some(DEFAULT_IMG_LEFT.to_string())),
-    )
-    .unwrap_or_default();
-
-    let img_right_path = expand_path(
-        conf.imgs
-            .as_ref()
-            .and_then(|i| i.right.clone())
-            .or_else(|| Some(DEFAULT_IMG_RIGHT.to_string())),
-    )
-    .unwrap_or_default();
+    let img_rest_path = image_path(
+        conf.imgs.as_ref().and_then(|i| i.rest.clone()),
+        "cat-rest.png",
+    );
+    let img_left_path = image_path(
+        conf.imgs.as_ref().and_then(|i| i.left.clone()),
+        "cat-left.png",
+    );
+    let img_right_path = image_path(
+        conf.imgs.as_ref().and_then(|i| i.right.clone()),
+        "cat-right.png",
+    );
 
     let image = Image::from_file(&img_rest_path);
     image.set_pixel_size(48);
@@ -194,75 +211,5 @@ fn build_ui(app: &Application, conf: Config) {
         .and_then(|i| i.device.clone())
         .unwrap_or_else(|| "AT Translated Set 2 keyboard".to_string());
 
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        rt.block_on(async move {
-            let mut target_device = None;
-
-            println!("[INFO] Starting scan of /dev/input/...");
-            if let Ok(entries) = std::fs::read_dir("/dev/input/") {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path
-                        .file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .starts_with("event")
-                    {
-                        match evdev::Device::open(&path) {
-                            Ok(device) => {
-                                if let Some(name) = device.name() {
-                                    println!(
-                                        "[INFO] Opened file {:?}, device name: \"{}\"",
-                                        path, name
-                                    );
-                                    if name == target_device_name {
-                                        println!(
-                                            "[INFO] Match found! Selecting device: {:?}",
-                                            path
-                                        );
-                                        target_device = Some(device);
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                println!("[ERROR] Failed to open file {:?}. Error: {}", path, e);
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let Some(device) = target_device {
-                println!("[INFO] Creating event stream...");
-                if let Ok(mut event_stream) = device.into_event_stream() {
-                    println!("[INFO] Event stream started successfully. Start typing!");
-                    let mut strike_left = true;
-
-                    while let Ok(event) = event_stream.next_event().await {
-                        if let evdev::EventSummary::Key(_, _, value) = event.destructure() {
-                            if value > 0 {
-                                if strike_left {
-                                    state_input.store(STATE_LEFT, Ordering::Relaxed);
-                                } else {
-                                    state_input.store(STATE_RIGHT, Ordering::Relaxed);
-                                }
-                                strike_left = !strike_left;
-                            } else {
-                                state_input.store(STATE_REST, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                } else {
-                    println!("[ERROR] Failed to create event stream!");
-                }
-            }
-        });
-    });
+    platform::start_input(state_input, target_device_name);
 }
