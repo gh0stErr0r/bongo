@@ -5,7 +5,8 @@ A lightweight desktop widget that displays a Bongo Cat tapping its paws in real-
 ## Demonstration
 Tested on **niri** compositor.
 
-<video src="imgs/example.mp4" width="100%" controls autoplay loop muted></video>
+https://github.com/user-attachments/assets/f15b4fd8-ef80-43ce-944c-d3116e5d38bc
+
 
 ## Installation
 
